@@ -35,7 +35,7 @@
     "formula_context_slots": 1,
     "rerank_candidates": 24,
     "top_k": 4,
-    "neighbor_expansion": true,
+    "neighbor_expansion": false,
     "neighbor_top_n": 4,
     "max_context_chars": 9000
   },
