@@ -16,7 +16,7 @@ MODES = [
     ("no_context", "no_context"),
     ("rag_single", "rag_single"),
     ("rag_bm25_dual", "rag_bm25_dual"),
-    ("final", "final"),
+    ("full", "full"),
     ("ablation_no_hybrid", "no_hybrid"),
     ("ablation_no_reranker", "no_reranker"),
 ]

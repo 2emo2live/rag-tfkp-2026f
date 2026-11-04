@@ -2,7 +2,7 @@
 """Answer TFKP multiple-choice questions with a local evidence-based RAG.
 
 Modes (the first three are the required comparison, the last two are ablations):
-  final           hybrid BM25+dense, reranker, neighbour context
+  full           hybrid BM25+dense, reranker, neighbour context
   rag_single      one BM25 search, no reranker, no neighbours
   rag_bm25_dual   text BM25 + formula BM25 quota, no dense/reranker/neighbours
   no_context      the LLM answers without any retrieved fragments
@@ -30,7 +30,7 @@ import pymorphy3
 
 
 MODES = {
-    "final",
+    "full",
     "rag_single",
     "rag_bm25_dual",
     "no_context",
@@ -307,7 +307,7 @@ class Retriever:
         self.mode = mode
         self.embedding_model = None
         self.reranker = None
-        if mode in {"final", "no_reranker"}:
+        if mode in {"full", "no_reranker"}:
             from sentence_transformers import SentenceTransformer
 
             emb_cfg = cfg["embedding"]
@@ -315,7 +315,7 @@ class Retriever:
                 emb_cfg["model"], revision=emb_cfg.get("revision"), device="cpu",
                 local_files_only=True
             )
-        if mode in {"final", "no_hybrid"}:
+        if mode in {"full", "no_hybrid"}:
             from sentence_transformers import CrossEncoder
 
             rer_cfg = cfg["reranker"]
@@ -469,7 +469,7 @@ class Retriever:
             selected = ranked[:top_k]
 
         if (
-            self.mode in {"final", "no_hybrid", "no_reranker"}
+            self.mode in {"full", "no_hybrid", "no_reranker"}
             and ret.get("neighbor_expansion", True)
         ):
             selected = self._expand_neighbors(selected, int(ret.get("neighbor_top_n", 4)))
@@ -511,7 +511,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("config.json"))
-    parser.add_argument("--mode", choices=sorted(MODES), default="final")
+    parser.add_argument("--mode", choices=sorted(MODES), default="no_reranker")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
