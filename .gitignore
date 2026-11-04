@@ -1,0 +1,19 @@
+# Local data and artifacts: rebuild from the public corpus and models.
+corpus.jsonl
+corpus_manifest.jsonl
+index/
+experiments/
+.run/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Source PDF and local credentials/logs.
+*.pdf
+.env
+*.log
+
+# Keep the required submission artifacts tracked:
+# dev_answers.jsonl, dev_trace.jsonl, experiments.csv,
+# own_questions.jsonl, own_gold.jsonl, report.md, README.md.
