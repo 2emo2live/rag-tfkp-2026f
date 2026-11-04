@@ -31,6 +31,8 @@ SECTION_RE = re.compile(
 HYPHEN_CONT_RE = re.compile(r"^[а-яё]")
 TARGET_CHARS = 850
 MIN_CHARS = 180
+# Default overlap is 0 (disabled). Use --overlap-chars to enable.
+OVERLAP_CHARS = 100
 
 
 CMEX_MAP = {
@@ -124,12 +126,71 @@ def is_page_furniture(text: str, y: float, page_height: float) -> bool:
     return False
 
 
+def join_fraction_lines(text: str) -> str:
+    """
+    Join fraction parts split across lines.
+
+    In the PDF, fractions appear as:
+        <expression ending with number>
+        <number>
+    or:
+        <expression ending with number>
+        <number>i
+    or:
+        = 1
+        2πi
+
+    Pattern: first line ends with a digit, second line is a pure number
+    (possibly with suffix like i, πi). First line can be any expression.
+    """
+    lines = text.split("\n")
+    if len(lines) < 2:
+        return text
+
+    # Denominator: pure number, optionally followed by single letter (i) or πi
+    den_pattern = re.compile(r"^\s*\d+(?:π?i)?\s*$")
+
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        current = lines[i].rstrip()
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].lstrip()
+            curr_stripped = current.strip()
+            next_stripped = next_line.strip()
+
+            is_fraction_pair = False
+            if curr_stripped and next_stripped:
+                # Denominator must be a pure number (short)
+                if len(next_stripped) <= 15 and den_pattern.match(next_stripped):
+                    # Numerator must end with a digit
+                    if re.search(r"\d\s*$", curr_stripped):
+                        # Avoid joining regular sentences
+                        if not re.search(r"[.!?;:]$", curr_stripped):
+                            is_fraction_pair = True
+
+            if is_fraction_pair:
+                joined = f"{curr_stripped}/{next_stripped}"
+                out.append(joined)
+                i += 2
+                continue
+
+        out.append(current)
+        i += 1
+
+    return "\n".join(out)
+
+
 def clean_text(text: str) -> str:
-    text = text.replace("\u00ad", "")
+    text = text.replace("\u00ad", "")  # soft hyphen
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\s*\n\s*", "\n", text)
+
+    # Join fraction lines first (before other cleaning)
+    text = join_fraction_lines(text)
+
     text = text.strip()
-    # Fractions in the PDF are split into a numerator and a denominator line.
+    # Partial derivatives: ∂f ∂x → ∂f/∂x
     text = re.sub(r"(∂[A-Za-z])\s+(∂[A-Za-z])", r"\1/\2", text)
     text = re.sub(r"\bf\s+′", "f′", text)
     text = re.sub(r"\b([A-Za-z])\s+′", r"\1′", text)
@@ -166,6 +227,26 @@ def split_long_line(text: str, limit: int = TARGET_CHARS) -> list[str]:
     return final
 
 
+def tail(text: str, n: int) -> str:
+    """Return last n chars of text, trying to cut at word boundary."""
+    if len(text) <= n:
+        return text
+    cut = text.rfind(" ", len(text) - n)
+    if cut == -1:
+        return text[-n:]
+    return text[cut + 1:]
+
+
+def head(text: str, n: int) -> str:
+    """Return first n chars of text, trying to cut at word boundary."""
+    if len(text) <= n:
+        return text
+    cut = text.find(" ", n)
+    if cut == -1:
+        return text[:n]
+    return text[:cut]
+
+
 def append_line(buf: list[str], line: str) -> None:
     if not line:
         return
@@ -173,6 +254,86 @@ def append_line(buf: list[str], line: str) -> None:
         buf[-1] = buf[-1][:-1] + line
     else:
         buf.append(line)
+
+
+class ChunkBuilder:
+    """Builds chunks with optional overlap awareness."""
+
+    def __init__(self, overlap_chars: int = 0):
+        self.chunks: list[dict] = []
+        self.buf: list[str] = []
+        self.buf_page: int | None = None
+        self.section = ""
+        self.prev_chunk_text = ""  # text of previous chunk (for backward overlap)
+        self.overlap_chars = overlap_chars
+
+    def flush(self, page: int | None = None, force: bool = False) -> None:
+        """Flush current buffer as a chunk with backward overlap from previous chunk."""
+        if not self.buf or (self.buf_page is None and page is None):
+            return
+
+        text = clean_text("\n".join(self.buf))
+        if not text:
+            self.buf.clear()
+            self.buf_page = None
+            return
+
+        # Add backward overlap from previous chunk
+        if self.overlap_chars > 0 and self.prev_chunk_text:
+            overlap = tail(self.prev_chunk_text, self.overlap_chars)
+            if overlap:
+                text = overlap + "\n" + text
+
+        chunk_page = page if page is not None else self.buf_page
+        chunk = {"page": chunk_page, "section": self.section, "text": text}
+        self.chunks.append(chunk)
+
+        # Store this chunk's text for next chunk's backward overlap
+        self.prev_chunk_text = text
+
+        self.buf.clear()
+        self.buf_page = None
+
+    def add_line(self, line: str, page_no: int) -> None:
+        if self.buf_page is None:
+            self.buf_page = page_no
+        for part in split_long_line(line):
+            append_line(self.buf, part)
+        current_len = len(clean_text("\n".join(self.buf)))
+        if current_len >= TARGET_CHARS:
+            self.flush()
+
+    def set_section(self, section_text: str, page_no: int) -> None:
+        self.flush()
+        self.section = section_text
+        for part in split_long_line(section_text):
+            self.buf.append(part)
+        self.buf_page = page_no
+
+    def end_page(self) -> None:
+        self.flush()
+        if self.overlap_chars > 0:
+            self.prev_chunk_text = ""  # Reset overlap at page boundary
+
+    def get_chunks(self) -> list[dict]:
+        # Add forward overlap: each chunk gets head of next chunk
+        if self.overlap_chars == 0 or len(self.chunks) <= 1:
+            return self.chunks
+
+        overlapped: list[dict] = []
+        for i, chunk in enumerate(self.chunks):
+            text = chunk["text"]
+            if i + 1 < len(self.chunks):
+                next_text = self.chunks[i + 1]["text"]
+                # Only add overlap if same page and compatible section
+                if (self.chunks[i]["page"] == self.chunks[i + 1]["page"]
+                    and (not chunk["section"] or not self.chunks[i + 1]["section"]
+                         or chunk["section"] == self.chunks[i + 1]["section"])):
+                    overlap = head(next_text, self.overlap_chars)
+                    if overlap:
+                        text = text + "\n" + overlap
+            overlapped.append({**chunk, "text": text})
+        return overlapped
 
 
 def flush_chunk(
@@ -239,12 +400,9 @@ def repair_hyphen_splits(chunks: list[dict]) -> None:
         chunks[i + 1]["text"] = match.group(1) + right_stripped
 
 
-def extract_chunks(pdf_path: Path, first_page: int, last_page: int) -> list[dict]:
+def extract_chunks(pdf_path: Path, first_page: int, last_page: int, overlap_chars: int = 0) -> list[dict]:
     doc = pymupdf.open(pdf_path)
-    chunks: list[dict] = []
-    buf: list[str] = []
-    buf_page: int | None = None
-    section = ""
+    builder = ChunkBuilder(overlap_chars=overlap_chars)
 
     for page_index in range(first_page - 1, min(last_page, doc.page_count)):
         page = doc[page_index]
@@ -267,23 +425,12 @@ def extract_chunks(pdf_path: Path, first_page: int, last_page: int) -> list[dict
                     size >= 11.0 or len(text) < 90
                 )
                 if is_heading:
-                    flush_chunk(buf, buf_page, section, chunks)
-                    section = text
-                    for part in split_long_line(text):
-                        buf.append(part)
-                    buf_page = page_no
+                    builder.set_section(text, page_no)
                     continue
-                if buf_page is None:
-                    buf_page = page_no
-                for part in split_long_line(text):
-                    append_line(buf, part)
-                current_len = len(clean_text("\n".join(buf)))
-                if current_len >= TARGET_CHARS:
-                    flush_chunk(buf, buf_page, section, chunks)
-                    buf_page = None
-        flush_chunk(buf, buf_page, section, chunks)
-        buf_page = None
+                builder.add_line(text, page_no)
+        builder.end_page()
 
+    chunks = builder.get_chunks()
     chunks = merge_short_chunks(chunks)
     repair_hyphen_splits(chunks)
 
@@ -344,9 +491,15 @@ def main() -> None:
     )
     parser.add_argument("--first-page", type=int, default=3)
     parser.add_argument("--last-page", type=int, default=147)
+    parser.add_argument(
+        "--overlap-chars",
+        type=int,
+        default=0,
+        help="Number of characters to overlap between adjacent chunks (0 = disabled)",
+    )
     args = parser.parse_args()
 
-    chunks = extract_chunks(args.pdf, args.first_page, args.last_page)
+    chunks = extract_chunks(args.pdf, args.first_page, args.last_page, args.overlap_chars)
     write_outputs(chunks, args.output, args.manifest)
     total_chars = sum(len(c["text"]) for c in chunks)
     print(

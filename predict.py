@@ -371,7 +371,9 @@ class Retriever:
         ):
             selected = self._expand_neighbors(selected, int(ret.get("neighbor_top_n", 4)))
 
-        selected = sorted(dict.fromkeys(selected))
+        #selected = sorted(dict.fromkeys(selected))
+        selected = list(dict.fromkeys(selected))
+        
         context, context_ids = build_context(
             self.rows, selected, int(ret.get("max_context_chars", 9000))
         )

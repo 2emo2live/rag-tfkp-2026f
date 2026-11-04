@@ -123,7 +123,14 @@ STOPWORDS = {
     "я",
 }
 
-TOKEN_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
+#TOKEN_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
+TOKEN_RE = re.compile(
+    r"[А-Яа-яЁёA-Za-z]+"              # кириллица + латиница (слова, sin, cos, Re, Im)
+    r"|[\u0370-\u03FF\u1F00-\u1FFF]+"  # греческий: α β γ ζ π φ ψ ω λ σ θ Γ Δ
+    r"|\d+"                             # целые
+    r"|[+\-−=<>≤≥≠±∓×÷^_/|(){}\[\]"    # операторы (включая U+2212)
+    r"∫∑∏∂√∞∈⊂∪∩→⇒′″·]"                # математические символы
+)
 
 
 def normalize_text(text: str) -> str:
@@ -136,13 +143,13 @@ def tokenize(text: str, morph: pymorphy3.MorphAnalyzer) -> list[str]:
         if token.isdigit():
             tokens.append(token)
             continue
-        # Latin single-letter variables (f, z, u, v, ...) are meaningful.
-        if len(token) == 1 and not re.match(r"[A-Za-z]", token):
-            continue
-        if token in STOPWORDS:
+        #if len(token) == 1 and not re.match(r"[A-Za-z]", token):
+        if len(token) == 1 and not re.match(r"[A-Za-z\u0370-\u03FF]", token):
             continue
         if re.match(r"[А-Яа-яЁё]", token):
             token = morph.parse(token)[0].normal_form
+        if token in STOPWORDS:
+            continue
         tokens.append(token)
     return tokens
 
