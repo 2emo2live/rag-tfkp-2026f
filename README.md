@@ -17,6 +17,8 @@ export LLM_MODEL="mlx-community/Qwen3.5-4B-MLX-4bit"
 export LLM_API_KEY="local"
 export SUBMISSION_ID="local-dev"
 
+python download_models.py
+
 python build_index.py \
   --corpus /path/to/corpus.jsonl \
   --output ./index \
