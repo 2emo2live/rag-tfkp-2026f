@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Iterable
 
@@ -123,28 +124,31 @@ STOPWORDS = {
     "я",
 }
 
-#TOKEN_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
-TOKEN_RE = re.compile(
-    r"[А-Яа-яЁёA-Za-z]+"              # кириллица + латиница (слова, sin, cos, Re, Im)
-    r"|[\u0370-\u03FF\u1F00-\u1FFF]+"  # греческий: α β γ ζ π φ ψ ω λ σ θ Γ Δ
-    r"|\d+"                             # целые
-    r"|[+\-−=<>≤≥≠±∓×÷^_/|(){}\[\]"    # операторы (включая U+2212)
-    r"∫∑∏∂√∞∈⊂∪∩→⇒′″·]"                # математические символы
+# Prose and formulae are deliberately indexed separately.  Indexing '=' or
+# '∂' as standalone terms makes almost every mathematical chunk look alike.
+TOKEN_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+")
+FORMULA_ATOM_RE = re.compile(
+    r"partial|sqrt|pi|[a-z]+bar|[a-z]+prime\d*|[a-z]+|\d+|[=+\-*/^()]"
 )
+FORMULA_MARKER_RE = re.compile(
+    r"partial|sqrt|pi|[a-z]+bar|[a-z]+prime\d*|[∫∑∏∂√∞=+\-−*/^′″̅]"
+)
+FORMULA_OPERATORS = {"=", "+", "-", "*", "/", "^", "(", ")"}
 
 
 def normalize_text(text: str) -> str:
     return text.lower().replace("ё", "е")
 
 
-def tokenize(text: str, morph: pymorphy3.MorphAnalyzer) -> list[str]:
+def tokenize_words(text: str, morph: pymorphy3.MorphAnalyzer) -> list[str]:
+    """Lemmatise natural-language text for the prose BM25 index."""
     tokens: list[str] = []
     for token in TOKEN_RE.findall(normalize_text(text)):
         if token.isdigit():
             tokens.append(token)
             continue
-        #if len(token) == 1 and not re.match(r"[A-Za-z]", token):
-        if len(token) == 1 and not re.match(r"[A-Za-z\u0370-\u03FF]", token):
+        # Latin variables in prose are useful; isolated Cyrillic letters are not.
+        if len(token) == 1 and not re.match(r"[A-Za-z]", token):
             continue
         if re.match(r"[А-Яа-яЁё]", token):
             token = morph.parse(token)[0].normal_form
@@ -152,6 +156,55 @@ def tokenize(text: str, morph: pymorphy3.MorphAnalyzer) -> list[str]:
             continue
         tokens.append(token)
     return tokens
+
+
+# Preserve the previous public function name for callers importing tokenize.
+tokenize = tokenize_words
+
+
+def normalize_formula_text(text: str) -> str:
+    """Canonicalise common PDF/LaTex spellings before extracting features."""
+    text = unicodedata.normalize("NFC", text.lower())
+    text = text.replace(r"\partial", " partial ")
+    text = text.replace(r"\pi", " pi ")
+    text = text.replace(r"\sqrt", " sqrt ")
+    text = re.sub(r"\\bar\s*\{\s*([a-z])\s*\}", r" \1bar ", text)
+    text = re.sub(r"\\overline\s*\{\s*([a-z])\s*\}", r" \1bar ", text)
+    text = re.sub(r"\\bar\s+([a-z])", r" \1bar ", text)
+    text = re.sub(r"\\overline\s+([a-z])", r" \1bar ", text)
+    # The PDF extractor represents a bar as the combining U+0305 character.
+    text = re.sub(r"([a-z])\u0305", r" \1bar ", text)
+    text = re.sub(r"([a-z])[′']{2}", r" \1prime2 ", text)
+    text = re.sub(r"([a-z])[′']", r" \1prime ", text)
+    text = text.replace("∂", " partial ").replace("√", " sqrt ")
+    text = text.replace("π", " pi ").replace("−", "-")
+    return re.sub(r"[ \t]+", " ", text)
+
+
+def formula_ngrams(text: str) -> list[str]:
+    """Generate formula-aware 2--3-gram BM25 features.
+
+    Formula operators identify an expression but never become independent
+    tokens.  For instance, both ∂f/∂z̅ and its LaTex spelling emit
+    ``math:partial_f_partial`` and ``math:f_partial_zbar``.
+    """
+    features: list[str] = []
+    for line in normalize_formula_text(text).splitlines():
+        if not FORMULA_MARKER_RE.search(line):
+            continue
+        atoms = [
+            atom for atom in FORMULA_ATOM_RE.findall(line)
+            if atom not in FORMULA_OPERATORS
+        ]
+        if not atoms:
+            continue
+        for atom in atoms:
+            if atom in {"partial", "sqrt", "pi"} or atom.endswith(("bar", "prime", "prime2")):
+                features.append(f"math:{atom}")
+        for n in (2, 3):
+            for start in range(len(atoms) - n + 1):
+                features.append("math:" + "_".join(atoms[start : start + n]))
+    return features
 
 
 def load_corpus(path: Path) -> list[dict]:
@@ -200,7 +253,7 @@ def build_embeddings(
 ) -> np.ndarray:
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name, revision=revision, device="cpu")
+    model = SentenceTransformer(model_name, revision=revision, device="cpu", local_files_only=True)
     passages = ["passage: " + text for text in texts]
     vectors = model.encode(
         passages,
@@ -227,7 +280,8 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
 
     morph = pymorphy3.MorphAnalyzer()
-    tokenized = [tokenize(row["text"], morph) for row in rows]
+    text_tokens = [tokenize_words(row["text"], morph) for row in rows]
+    math_tokens = [formula_ngrams(row["text"]) for row in rows]
 
     # Keep the corpus exactly as supplied (block ids are part of the contract).
     corpus_copy = args.output / "chunks.jsonl"
@@ -239,7 +293,11 @@ def main() -> None:
         json.dump(
             {
                 "block_ids": [row["block_id"] for row in rows],
-                "tokens": tokenized,
+                # ``tokens`` is retained for backwards compatibility with
+                # earlier indexes; new readers use the explicit field names.
+                "tokens": text_tokens,
+                "text_tokens": text_tokens,
+                "formula_tokens": math_tokens,
                 "k1": float(retrieval_cfg.get("bm25_k1", 1.5)),
                 "b": float(retrieval_cfg.get("bm25_b", 0.75)),
             },
@@ -256,7 +314,7 @@ def main() -> None:
     np.save(args.output / "embeddings.npy", vectors)
 
     meta = {
-        "format_version": 1,
+        "format_version": 2,
         "corpus_sha256": file_sha256(args.corpus),
         "chunk_count": len(rows),
         "embedding_model": embedding_cfg["model"],
@@ -265,7 +323,7 @@ def main() -> None:
         "bm25": {
             "k1": float(retrieval_cfg.get("bm25_k1", 1.5)),
             "b": float(retrieval_cfg.get("bm25_b", 0.75)),
-            "tokenizer": "pymorphy3+simple-regex",
+            "tokenizer": "pymorphy3 prose + formula 2-3grams",
         },
     }
     (args.output / "index_meta.json").write_text(

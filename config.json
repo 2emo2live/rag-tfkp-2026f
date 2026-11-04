@@ -1,0 +1,53 @@
+{
+  "llm": {
+    "official_model": "Qwen/Qwen3.5-4B",
+    "official_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "local_model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "local_revision": "32f3e8ecf65426fc3306969496342d504bfa13f3",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_tokens": 900,
+    "seed": 42,
+    "enable_thinking": false,
+    "timeout_s": 240
+  },
+  "embedding": {
+    "model": "intfloat/multilingual-e5-base",
+    "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+    "batch_size": 32,
+    "normalize": true,
+    "query_prefix": "query: ",
+    "passage_prefix": "passage: "
+  },
+  "reranker": {
+    "model": "DiTy/cross-encoder-russian-msmarco",
+    "revision": "9029bab08103ad171724b510d312befa5b476293",
+    "batch_size": 16,
+    "max_length": 512,
+    "enabled": true
+  },
+  "retrieval": {
+    "bm25_k1": 1.5,
+    "bm25_b": 0.75,
+    "candidate_k": 40,
+    "rrf_k": 60,
+    "formula_rrf_weight": 0.5,
+    "formula_context_slots": 1,
+    "rerank_candidates": 24,
+    "top_k": 4,
+    "neighbor_expansion": true,
+    "neighbor_top_n": 4,
+    "max_context_chars": 9000
+  },
+
+  "prompt": {
+    "max_rationale_chars": 1200,
+    "max_citations": 4
+  },
+  "limits": {
+    "max_llm_calls": 4,
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "max_request_tokens": 8192
+  }
+}
