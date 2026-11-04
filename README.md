@@ -33,7 +33,7 @@ python predict.py \
 ```
 
 Предполагается, что corpus.jsonl уже существует. Его можно создать с помощью make_corpus.py.
-`predict.py` поддерживает режимы `final`, `rag_single`, `rag_bm25_dual`, `no_context`, `no_hybrid`, `no_reranker`. `rag_bm25_dual` использует текстовый BM25 и резервирует один слот контекста для формульного BM25. Режим по умолчанию — `final`.
+`predict.py` поддерживает режимы `full`, `rag_single`, `rag_bm25_dual`, `no_context`, `no_hybrid`, `no_reranker`. `rag_bm25_dual` использует текстовый BM25 и резервирует один слот контекста для формульного BM25. Режим по умолчанию — `no_reranker`.
 
 ## Формат корпуса
 
