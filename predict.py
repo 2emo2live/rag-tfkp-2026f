@@ -571,7 +571,9 @@ def main() -> None:
             answer: dict = {}
             last_content = ""
 
-            for attempt in range(2):
+            max_attempts = 1 if args.mode == "rag_single" else 2
+
+            for attempt in range(max_attempts):
                 try:
                     content, in_tok, out_tok = call_llm(
                         client, model, messages, cfg, qid, submission_id
