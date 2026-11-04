@@ -4,6 +4,7 @@
 Modes (the first three are the required comparison, the last two are ablations):
   final           hybrid BM25+dense, reranker, neighbour context
   rag_single      one BM25 search, no reranker, no neighbours
+  rag_bm25_dual   text BM25 + formula BM25 quota, no dense/reranker/neighbours
   no_context      the LLM answers without any retrieved fragments
   no_hybrid       BM25 only + reranker + neighbours
   no_reranker     hybrid retrieval without the cross-encoder reranker
@@ -24,11 +25,18 @@ from typing import Any
 import numpy as np
 from openai import OpenAI
 
-from build_index import tokenize
+from build_index import formula_ngrams, tokenize
 import pymorphy3
 
 
-MODES = {"final", "rag_single", "no_context", "no_hybrid", "no_reranker"}
+MODES = {
+    "final",
+    "rag_single",
+    "rag_bm25_dual",
+    "no_context",
+    "no_hybrid",
+    "no_reranker",
+}
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -126,6 +134,8 @@ def prompt_with_context(question: dict, context: str) -> list[dict]:
 4. Если данных достаточно, верни abstain=false, непустые answer_ids и citations.
 5. rationale — краткое обоснование по-русски, не более 700 символов. Укажи, почему выбранные варианты верны, а ключевые альтернативы нет.
 6. Учитывай, что сопряжение в учебнике может быть записано как z̅ (z с надчеркиванием), а также что формулы могли разбиться при извлечении текста.
+7. Выбирай вариант, только если верно именно его собственное утверждение. Не выбирай вариант лишь потому, что он был бы следствием более сильного условия из учебника: например, «только локально, но не глобально» ложно при доказанном глобальном результате, а условие для одного фиксированного семейства не становится достаточным из того, что теорема требует его для всех объектов.
+8. Перед возвратом JSON проверь согласованность: каждый выбранный ID должен быть назван верным в rationale, каждый названный в rationale верный ID должен быть в answer_ids, а логически несовместимые варианты нельзя выбрать одновременно.
 
 Ответ строго в формате:
 {{"answer_ids":["A","C"],"abstain":false,"rationale":"...","citations":["b_..."]}}"""
@@ -277,7 +287,17 @@ class Retriever:
         from rank_bm25 import BM25Okapi
 
         self.bm25 = BM25Okapi(
-            bm25_data["tokens"],
+            bm25_data.get("text_tokens", bm25_data["tokens"]),
+            k1=float(bm25_data.get("k1", 1.5)),
+            b=float(bm25_data.get("b", 0.75)),
+        )
+        formula_tokens = bm25_data.get("formula_tokens")
+        if formula_tokens is None:
+            raise SystemExit(
+                "index has no formula BM25 tokens; rebuild it with build_index.py"
+            )
+        self.formula_bm25 = BM25Okapi(
+            formula_tokens,
             k1=float(bm25_data.get("k1", 1.5)),
             b=float(bm25_data.get("b", 0.75)),
         )
@@ -292,7 +312,8 @@ class Retriever:
 
             emb_cfg = cfg["embedding"]
             self.embedding_model = SentenceTransformer(
-                emb_cfg["model"], revision=emb_cfg.get("revision"), device="cpu"
+                emb_cfg["model"], revision=emb_cfg.get("revision"), device="cpu",
+                local_files_only=True
             )
         if mode in {"final", "no_hybrid"}:
             from sentence_transformers import CrossEncoder
@@ -303,11 +324,28 @@ class Retriever:
                 revision=rer_cfg.get("revision"),
                 device="cpu",
                 max_length=int(rer_cfg.get("max_length", 512)),
+                local_files_only=True
             )
 
     def _bm25_scores(self, question: str) -> np.ndarray:
         tokens = tokenize(question, self.morph)
         return np.asarray(self.bm25.get_scores(tokens), dtype=np.float64)
+
+    def _formula_scores(self, question: str) -> np.ndarray | None:
+        tokens = formula_ngrams(question)
+        # A formula consisting only of generic variables (f, z, u, ...) is
+        # not selective enough to re-rank the prose result.  Use the formula
+        # index only when the query has a structural marker that survives PDF
+        # extraction, such as a Wirtinger derivative, conjugation or prime.
+        discriminative = any(
+            token in {"math:partial", "math:sqrt", "math:pi"}
+            or "bar" in token
+            or "prime" in token
+            for token in tokens
+        )
+        if not tokens or not discriminative:
+            return None
+        return np.asarray(self.formula_bm25.get_scores(tokens), dtype=np.float64)
 
     def _dense_scores(self, question: str) -> np.ndarray:
         prefix = self.cfg["embedding"].get("query_prefix", "query: ")
@@ -319,34 +357,79 @@ class Retriever:
         )[0]
         return self.embeddings @ vector.astype(np.float32)
 
-    def _top_indices(self, scores: np.ndarray, k: int) -> list[int]:
+    def _top_indices(
+        self, scores: np.ndarray, k: int, positive_only: bool = False
+    ) -> list[int]:
         if k <= 0:
             return []
-        order = np.argsort(-scores, kind="stable")[: min(k, len(scores))]
+        if positive_only:
+            candidates = np.flatnonzero(scores > 0)
+            if not len(candidates):
+                return []
+            order = candidates[np.argsort(-scores[candidates], kind="stable")]
+        else:
+            order = np.argsort(-scores, kind="stable")
+        order = order[: min(k, len(order))]
         return [int(i) for i in order]
 
-    def _rrf(self, rankings: list[list[int]]) -> list[int]:
+    def _rrf(
+        self, rankings: list[list[int]], weights: list[float] | None = None
+    ) -> list[int]:
         rrf_k = float(self.cfg["retrieval"].get("rrf_k", 60))
+        if weights is None:
+            weights = [1.0] * len(rankings)
+        if len(rankings) != len(weights):
+            raise ValueError("rankings and weights must have equal lengths")
         fused: dict[int, float] = {}
-        for ranking in rankings:
+        for ranking, weight in zip(rankings, weights):
             for rank, idx in enumerate(ranking, 1):
-                fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
+                fused[idx] = fused.get(idx, 0.0) + weight / (rrf_k + rank)
         return sorted(fused, key=lambda idx: (-fused[idx], idx))
 
-    def retrieve(self, question: str) -> tuple[list[int], list[str]]:
+    def retrieve(self, question: dict | str) -> tuple[list[int], list[str]]:
+        """Retrieve evidence, including formulae that occur only in options.
+
+        The prose/dense query remains the question itself to avoid letting
+        distractor wording dominate topical retrieval.  The formula BM25 and
+        reranker additionally see the options, because they often contain the
+        only distinction between \u2202f/\u2202z and \u2202f/\u2202z\u0305, signs, or exponents.
+        """
+        if isinstance(question, dict):
+            question_text = str(question["question"])
+            options_text = format_options(question.get("options", []))
+            formula_query = question_text + "\n" + options_text
+            rerank_query = question_text + "\n\nВарианты:\n" + options_text
+        else:
+            question_text = question
+            formula_query = question
+            rerank_query = question
+
         ret = self.cfg["retrieval"]
         candidate_k = int(ret.get("candidate_k", 40))
-        bm25_ranking = self._top_indices(self._bm25_scores(question), candidate_k)
+        bm25_ranking = self._top_indices(self._bm25_scores(question_text), candidate_k)
+        sparse_rankings = [bm25_ranking]
+        sparse_weights = [1.0]
+        formula_ranking: list[int] = []
+        formula_scores = self._formula_scores(formula_query)
+        if formula_scores is not None and self.mode != "rag_single":
+            formula_ranking = self._top_indices(
+                formula_scores, candidate_k, positive_only=True
+            )
+            if formula_ranking:
+                sparse_rankings.append(formula_ranking)
+                sparse_weights.append(float(ret.get("formula_rrf_weight", 0.5)))
 
-        if self.mode in {"rag_single", "no_hybrid"}:
+        if self.mode == "rag_single":
             fused = bm25_ranking
+        elif self.mode in {"rag_bm25_dual", "no_hybrid"}:
+            fused = self._rrf(sparse_rankings, sparse_weights)
         else:
-            dense_ranking = self._top_indices(self._dense_scores(question), candidate_k)
-            fused = self._rrf([bm25_ranking, dense_ranking])
+            dense_ranking = self._top_indices(self._dense_scores(question_text), candidate_k)
+            fused = self._rrf(sparse_rankings + [dense_ranking], sparse_weights + [1.0])
 
         if self.reranker is not None:
             shortlist = fused[: int(ret.get("rerank_candidates", 24))]
-            pairs = [(question, self.rows[idx]["text"]) for idx in shortlist]
+            pairs = [(rerank_query, self.rows[idx]["text"]) for idx in shortlist]
             scores = self.reranker.predict(
                 pairs,
                 batch_size=int(self.cfg["reranker"].get("batch_size", 16)),
@@ -363,7 +446,27 @@ class Retriever:
             ranked = fused
 
         top_k = int(ret.get("top_k", 6))
-        selected = ranked[:top_k]
+        if self.mode == "rag_bm25_dual" and formula_ranking:
+            # RRF alone can displace a very strong prose hit with an unrelated
+            # formula hit.  Reserve a small, explicit formula quota instead:
+            # text retrieval supplies the topic and formula retrieval can add
+            # the exact symbolic condition without replacing that topic.
+            formula_slots = min(
+                int(ret.get("formula_context_slots", 1)), max(0, top_k - 1)
+            )
+            selected = list(bm25_ranking[: top_k - formula_slots])
+            for idx in formula_ranking:
+                if idx not in selected:
+                    selected.append(idx)
+                    if len(selected) >= top_k:
+                        break
+            for idx in bm25_ranking:
+                if len(selected) >= top_k:
+                    break
+                if idx not in selected:
+                    selected.append(idx)
+        else:
+            selected = ranked[:top_k]
 
         if (
             self.mode in {"final", "no_hybrid", "no_reranker"}
@@ -439,7 +542,7 @@ def main() -> None:
             context_ids: list[str] = []
             context = ""
             if retriever is not None:
-                selected = retriever.retrieve(question["question"])[0]
+                selected = retriever.retrieve(question)[0]
                 context, context_ids = build_context(
                     retriever.rows,
                     selected,
